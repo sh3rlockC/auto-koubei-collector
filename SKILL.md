@@ -208,7 +208,27 @@ python3 skills/auto-koubei-collector/scripts/export_autohome_koubei.py \
   --workdir /Users/xyc/.openclaw/workspace
 ```
 
-## 12. 唤起示例
+## 12. 推荐调用方式
+
+优先按下面顺序接收输入：
+
+1. **直接给汽车之家口碑页 URL**
+2. **直接给车型 `seriesId`**
+3. **给明确车型名，并允许先定位车型页面**
+
+推荐示例：
+
+- 帮我抓这个汽车之家口碑页对应车型的最满意和最不满意，导出 Excel：`https://k.autohome.com.cn/8208?dimensionid=10&order=0&yearid=0#listcontainer`
+- 帮我抓 8208 最满意和最不满意口碑，导出 Excel
+- 帮我抓汽车之家风云T11最满意和最不满意口碑，先帮我定位车型页面，再导出 Excel
+
+说明：
+
+- 可以只用自然语言调用
+- 但当前版本最稳的方式仍然是：**提供口碑页 URL 或 seriesId**
+- 若只给车型名，也可以执行，但通常需要先定位该车型在汽车之家的口碑页面
+
+## 13. 唤起示例
 
 当用户出现类似需求时，使用本 skill：
 
