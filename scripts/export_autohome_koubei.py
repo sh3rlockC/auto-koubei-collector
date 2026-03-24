@@ -15,8 +15,10 @@
 """
 
 import argparse
+import json
 import subprocess
 import time
+from collections import Counter
 from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
@@ -190,6 +192,49 @@ def write_xlsx(out_path: Path, groups: dict):
     wb.save(out_path)
 
 
+def validate_results(sat_rows, unsat_rows):
+    page_counts = {
+        '最满意': Counter(r['抓取页码'] for r in sat_rows),
+        '最不满意': Counter(r['抓取页码'] for r in unsat_rows),
+    }
+    issues = []
+
+    if len(sat_rows) != len(unsat_rows):
+        issues.append({
+            'type': 'total_mismatch',
+            'message': f'最满意总数 {len(sat_rows)} != 最不满意总数 {len(unsat_rows)}',
+            'sat_total': len(sat_rows),
+            'unsat_total': len(unsat_rows),
+        })
+
+    pages = sorted(set(page_counts['最满意']) | set(page_counts['最不满意']))
+    for page in pages:
+        sat_count = page_counts['最满意'].get(page, 0)
+        unsat_count = page_counts['最不满意'].get(page, 0)
+        if sat_count != unsat_count:
+            issues.append({
+                'type': 'page_mismatch',
+                'message': f'第 {page} 页数量不一致：最满意 {sat_count}，最不满意 {unsat_count}',
+                'page': page,
+                'sat_count': sat_count,
+                'unsat_count': unsat_count,
+            })
+
+    return {
+        'ok': not issues,
+        'issues': issues,
+        'page_counts': {
+            k: dict(sorted(v.items())) for k, v in page_counts.items()
+        },
+        'sat_total': len(sat_rows),
+        'unsat_total': len(unsat_rows),
+    }
+
+
+def write_validation_report(path: Path, report: dict):
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
 def main():
     parser = argparse.ArgumentParser(description='Export Autohome koubei to xlsx')
     parser.add_argument('--series-id', type=int, required=True)
@@ -197,6 +242,7 @@ def main():
     parser.add_argument('--end-page', type=int, required=True)
     parser.add_argument('--output', required=True)
     parser.add_argument('--workdir', default='.')
+    parser.add_argument('--strict-validate', action='store_true', help='总数或分页数量不一致时返回非零退出码')
     args = parser.parse_args()
 
     cwd = Path(args.workdir).resolve()
@@ -213,11 +259,25 @@ def main():
     out_path = Path(args.output).resolve()
     write_xlsx(out_path, groups)
 
+    report = validate_results(sat_rows, unsat_rows)
+    report['anomalies'] = len(sat_bad) + len(unsat_bad)
+    report_path = out_path.with_suffix('.validation.json')
+    write_validation_report(report_path, report)
+
     print(f'Wrote: {out_path}')
+    print(f'Validation: {report_path}')
     print('Counts:')
     for k, v in groups.items():
         print(f'- {k}: {len(v)}')
     print(f'- anomalies: {len(sat_bad) + len(unsat_bad)}')
+    if report['ok']:
+        print('- validation: OK')
+    else:
+        print('- validation: FAILED')
+        for issue in report['issues']:
+            print(f"  * {issue['message']}")
+        if args.strict_validate:
+            raise SystemExit(2)
 
 
 if __name__ == '__main__':

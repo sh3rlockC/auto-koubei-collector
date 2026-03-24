@@ -13,6 +13,8 @@
   - 车主购车口碑
   - 试驾探店口碑
 - 按正式版结构导出 Excel
+- 导出后自动生成同名 `.validation.json` 校验报告
+- 支持 `--strict-validate`，在校验失败时直接报错退出
 - 支持文件命名规则：
   - `ZJ+车型名称+最满意or最不满意_页数范围.xlsx`
 
@@ -79,6 +81,7 @@ python3 scripts/export_autohome_koubei.py \
 - 购车口碑 / 试驾探店口碑是否正确分流
 - 最满意 / 最不满意两个维度是否符合业务预期
 - Excel 命名和 sheet 结构是否正确
+- `.validation.json` 中总数与分页条数是否一致
 
 ## 调用方式
 
@@ -120,6 +123,18 @@ python3 scripts/export_autohome_koubei.py \
   --end-page <结束页> \
   --output ./ZJ车型名称最满意or最不满意_页数范围.xlsx \
   --workdir <workspace路径>
+```
+
+如需在校验失败时直接中断：
+
+```bash
+python3 scripts/export_autohome_koubei.py \
+  --series-id <车型ID> \
+  --start-page <起始页> \
+  --end-page <结束页> \
+  --output ./ZJ车型名称最满意or最不满意_页数范围.xlsx \
+  --workdir <workspace路径> \
+  --strict-validate
 ```
 
 ## 输出规则
