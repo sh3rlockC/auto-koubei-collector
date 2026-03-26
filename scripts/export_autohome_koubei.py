@@ -14,11 +14,12 @@
 """
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
 import time
-from collections import Counter, defaultdict
+from html import unescape
 from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
@@ -55,6 +56,62 @@ def get_snapshot(cwd: Path, url: str, session: str, retries: int = 2):
             last_err = r1.stderr or r1.stdout
         time.sleep(1)
     raise RuntimeError(last_err)
+
+
+def get_page_html(cwd: Path, url: str, session: str, retries: int = 2):
+    last_err = ''
+    for _ in range(retries + 1):
+        r1 = run(f"agent-browser --session {session} open '{url}' >/dev/null", cwd)
+        if r1.returncode != 0:
+            last_err = r1.stderr or r1.stdout
+            time.sleep(1)
+            continue
+        r2 = run(f"agent-browser --session {session} eval 'document.documentElement.outerHTML'", cwd)
+        if r2.returncode == 0 and r2.stdout.strip():
+            return r2.stdout
+        last_err = r2.stderr or r2.stdout
+        time.sleep(1)
+    raise RuntimeError(last_err)
+
+
+def get_snapshot_any(cwd: Path, url: str, session: str, retries: int = 2):
+    last_err = ''
+    for _ in range(retries + 1):
+        r1 = run(f"agent-browser --session {session} open '{url}' >/dev/null", cwd)
+        if r1.returncode == 0:
+            r2 = run(f"agent-browser --session {session} snapshot -c", cwd)
+            if r2.returncode == 0 and r2.stdout.strip():
+                return r2.stdout.splitlines()
+            last_err = r2.stderr or r2.stdout
+        else:
+            last_err = r1.stderr or r1.stdout
+        time.sleep(1)
+    raise RuntimeError(last_err)
+
+
+def detect_max_page(cwd: Path, series_id: int, dimensionid: int) -> int:
+    html = get_page_html(cwd, url_for(series_id, dimensionid, 1), f'koubei_detect_{series_id}_{dimensionid}')
+    html = unescape(html)
+
+    candidates = set()
+
+    for m in re.finditer(rf'/{series_id}/index_(\d+)\.html\?dimensionid={dimensionid}', html):
+        candidates.add(int(m.group(1)))
+
+    for m in re.finditer(r'ace-pagination__link[^>]*>(\d+)<', html):
+        candidates.add(int(m.group(1)))
+
+    for m in re.finditer(r'分页[^\n]{0,200}?共\s*(\d+)\s*页', html):
+        candidates.add(int(m.group(1)))
+
+    for m in re.finditer(r'共\s*(\d+)\s*页', html):
+        candidates.add(int(m.group(1)))
+
+    for m in re.finditer(r'尾页[^\n]{0,120}?index_(\d+)\.html', html):
+        candidates.add(int(m.group(1)))
+
+    candidates = {x for x in candidates if x >= 1}
+    return max(candidates) if candidates else 1
 
 
 def norm_user(raw: str) -> str:
@@ -108,7 +165,7 @@ def extract_cards(lines):
     return uniq
 
 
-def parse_card(lines, dim_name: str, page: int):
+def parse_card(lines, dim_name: str, page: int, cwd=None):
     row = {
         '口碑维度': dim_name,
         '抓取页码': page,
@@ -117,6 +174,8 @@ def parse_card(lines, dim_name: str, page: int):
         '行驶里程': '', '电耗': '', '裸车购买价': '', '参考价格': '', '购买时间': '',
         '探店时间': '', '购买地点': '', '探店地点': '', '评价详情': '', '来源链接': ''
     }
+
+    compact = ' '.join(l.strip() for l in lines)
 
     for i, l in enumerate(lines):
         s = l.strip()
@@ -179,6 +238,22 @@ def parse_card(lines, dim_name: str, page: int):
                 row['评价详情'] = s[len(prefix):].strip()
                 row['数据类型'] = dtype
 
+        if s in ('- text: 满意', '- text: 不满意') and not row['评价详情']:
+            m = re.search(r'- text: (?:满意|不满意)\s+(.*?)\s+- listitem:', compact)
+            if m:
+                candidate = m.group(1).strip()
+                if candidate and not candidate.startswith('- listitem:'):
+                    row['评价详情'] = candidate
+                    row['数据类型'] = '车主购车口碑'
+
+        if s in ('- text: 好评', '- text: 槽点') and not row['评价详情']:
+            m = re.search(r'- text: (?:好评|槽点)\s+(.*?)\s+- listitem:', compact)
+            if m:
+                candidate = m.group(1).strip()
+                if candidate and not candidate.startswith('- listitem:'):
+                    row['评价详情'] = candidate
+                    row['数据类型'] = '试驾探店口碑'
+
         m = re.search(r'https://k\.autohome\.com\.cn/detail/view_[^\s]+', s)
         if m and not row['来源链接']:
             row['来源链接'] = m.group(0)
@@ -186,8 +261,37 @@ def parse_card(lines, dim_name: str, page: int):
     if any([row['参考价格'], row['探店时间'], row['探店地点']]):
         row['数据类型'] = '试驾探店口碑'
 
+    if not row['评价详情'] and row['来源链接'] and cwd is not None:
+        try:
+            detail_session = f"kd_{hashlib.md5(row['来源链接'].encode('utf-8')).hexdigest()[:12]}"
+            detail_lines = get_snapshot_any(cwd, row['来源链接'], detail_session)
+            detail_text = extract_detail_text(detail_lines, row['口碑维度'])
+            if detail_text:
+                row['评价详情'] = detail_text
+        except Exception:
+            pass
+
     valid = all(row[k] for k in ['用户名', '综合口碑', '车型', '来源链接', '评价详情'])
     return row, valid
+
+
+def extract_detail_text(lines, dim_name: str) -> str:
+    target_heading = dim_name
+    collecting = False
+    parts = []
+    for raw in lines:
+        s = raw.strip()
+        if s.startswith(f'- heading "{target_heading}"'):
+            collecting = True
+            continue
+        if collecting and s.startswith('- heading "'):
+            break
+        if collecting and s.startswith('- paragraph:'):
+            text = s[len('- paragraph:'):].strip()
+            text = text.strip('"').strip()
+            if text and '上述内容的版权归' not in text:
+                parts.append(text)
+    return ' '.join(parts).strip()
 
 
 def collect_dimension(cwd: Path, series_id: int, dimensionid: int, start_page: int, end_page: int):
@@ -208,7 +312,7 @@ def collect_dimension(cwd: Path, series_id: int, dimensionid: int, start_page: i
             continue
 
         for c in cards:
-            row, valid = parse_card(c, dim_name, page)
+            row, valid = parse_card(c, dim_name, page, cwd=cwd)
             if valid:
                 rows.append(row)
             else:
@@ -318,13 +422,27 @@ def main():
     parser = argparse.ArgumentParser(description='Export aligned Autohome koubei to xlsx')
     parser.add_argument('--series-id', type=int, required=True)
     parser.add_argument('--start-page', type=int, default=1)
-    parser.add_argument('--end-page', type=int, required=True)
+    parser.add_argument('--end-page', type=int)
+    parser.add_argument('--auto-detect-pages', action='store_true', help='Auto detect max page when end page is omitted')
     parser.add_argument('--output', required=True)
     parser.add_argument('--workdir', default='.')
     parser.add_argument('--strict-validate', action='store_true')
     args = parser.parse_args()
 
     cwd = Path(args.workdir).resolve()
+
+    if args.end_page is None:
+        if args.auto_detect_pages or args.start_page == 1:
+            sat_max = detect_max_page(cwd, args.series_id, 10)
+            unsat_max = detect_max_page(cwd, args.series_id, 11)
+            args.end_page = max(sat_max, unsat_max)
+            print(f'Auto-detected end page: {args.end_page} (sat={sat_max}, unsat={unsat_max})')
+        else:
+            raise SystemExit('--end-page is required when start-page is not 1; pass --auto-detect-pages if you want automatic detection')
+
+    if args.start_page < 1 or args.end_page < args.start_page:
+        raise SystemExit('invalid page range: require start-page >= 1 and end-page >= start-page')
+
     sat_rows, sat_bad, sat_pages = collect_dimension(cwd, args.series_id, 10, args.start_page, args.end_page)
     unsat_rows, unsat_bad, unsat_pages = collect_dimension(cwd, args.series_id, 11, args.start_page, args.end_page)
 
