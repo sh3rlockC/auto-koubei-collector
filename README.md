@@ -10,6 +10,13 @@
 - 支持 `最满意` / `最不满意` 两个维度
 - 支持分页批量抓取
 - 支持未给最后页时自动探测总页数
+- 支持终端文本进度条
+- 支持输出 `.progress.json`
+- 支持输出 `.validation.json`
+- 支持输出 `.failed-pages.json`
+- 支持按失败页补抓：`--retry-failed-pages`
+- 支持把补抓结果合并进旧结果：`--merge-into`
+- 支持合并模式：`--merge-mode keep-extra|strict`
 - 区分：
   - 车主购车口碑
   - 试驾探店口碑
@@ -79,7 +86,48 @@ python3 scripts/export_autohome_koubei.py \
   --workdir /Users/xyc/.openclaw/workspace
 ```
 
-### 2. 已验证车型
+### 2. 增强测试方式
+
+失败页补抓：
+
+```bash
+python3 scripts/export_autohome_koubei.py \
+  --series-id 8208 \
+  --output ./ZJ风云X3L最满意or最不满意_修复版.xlsx \
+  --workdir /Users/xyc/.openclaw/workspace \
+  --retry-failed-pages ./ZJ风云X3L最满意or最不满意.failed-pages.json
+```
+
+合并进旧结果：
+
+```bash
+python3 scripts/export_autohome_koubei.py \
+  --series-id 8208 \
+  --output ./ZJ风云X3L最满意or最不满意_修复版.xlsx \
+  --workdir /Users/xyc/.openclaw/workspace \
+  --retry-failed-pages ./ZJ风云X3L最满意or最不满意.failed-pages.json \
+  --merge-into ./ZJ风云X3L最满意or最不满意.xlsx
+```
+
+严格模式：
+
+```bash
+python3 scripts/export_autohome_koubei.py \
+  --series-id 8208 \
+  --output ./ZJ风云X3L最满意or最不满意_修复版.xlsx \
+  --workdir /Users/xyc/.openclaw/workspace \
+  --retry-failed-pages ./ZJ风云X3L最满意or最不满意.failed-pages.json \
+  --merge-into ./ZJ风云X3L最满意or最不满意.xlsx \
+  --merge-mode strict
+```
+
+运行时会输出类似：
+
+```text
+抓取页面 [##########............] 总体 13/28 (46%) | 最满意 13/13 | ok 12 retry 1 fail 0 rows 286 | 最满意 第 13 页
+```
+
+### 3. 已验证车型
 
 - 风云X3L
 - 风云T11
@@ -156,14 +204,20 @@ ZJ+车型名称+最满意or最不满意_页数范围.xlsx
 - `ZJ风云X3L最满意or最不满意_1-13页.xlsx`
 - `ZJ风云T11最满意or最不满意_1-3页.xlsx`
 
+### 默认产物
+
+除 Excel 外，默认还会输出：
+
+- 同名 `.progress.json`
+- 同名 `.validation.json`
+- 同名 `.failed-pages.json`
+
 ### 默认 sheet 结构
 
-正式版默认拆成 4 个 sheet：
+当前导出结果默认包含 2 个 sheet：
 
-- `最满意_车主购车口碑`
-- `最满意_试驾探店口碑`
-- `最不满意_车主购车口碑`
-- `最不满意_试驾探店口碑`
+- `购车口碑`
+- `试驾口碑`
 
 ## 字段
 
@@ -202,4 +256,6 @@ ZJ+车型名称+最满意or最不满意_页数范围.xlsx
 - 用户明确给页码范围 → 按指定范围抓取
 - 用户未给页码，或表达“全部页面 / 所有页面 / 所有条目” → 先自动探测总页数，再执行抓取
 - 若列表页缺失某一侧正文 → 自动访问详情页回填，避免单条口碑掉数
-- 导出后默认生成同名 `.validation.json`，用于复核总量、分页计数和对齐异常
+- 导出后默认生成同名 `.progress.json` / `.validation.json` / `.failed-pages.json`
+- 支持按失败页补抓与合并旧结果
+- 支持 `keep-extra / strict` 两种 merge 模式

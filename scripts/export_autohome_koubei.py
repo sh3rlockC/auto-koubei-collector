@@ -18,11 +18,75 @@ import hashlib
 import json
 import re
 import subprocess
+import sys
 import time
+from datetime import datetime
 from html import unescape
 from pathlib import Path
-from openpyxl import Workbook
+from typing import Optional
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font
+
+
+class ProgressTracker:
+    def __init__(self, label: str, progress_path: Optional[Path] = None, quiet: bool = False):
+        self.label = label
+        self.progress_path = progress_path
+        self.quiet = quiet
+        self.state = {
+            'label': label,
+            'stage': 'init',
+            'current': 0,
+            'total': 0,
+            'percent': 0,
+            'success': 0,
+            'retry': 0,
+            'failed': 0,
+            'records': 0,
+            'message': '',
+            'updated_at': '',
+            'overall': {'current': 0, 'total': 0, 'percent': 0},
+            'current_dimension': '',
+            'dimension_progress': {},
+            'output_path': '',
+            'validation_path': '',
+            'failed_pages': [],
+        }
+
+    def _render_bar(self, current: int, total: int, width: int = 24) -> str:
+        if total <= 0:
+            return '[' + '.' * width + ']'
+        filled = min(width, int(width * current / total))
+        return '[' + '#' * filled + '.' * (width - filled) + ']'
+
+    def emit(self):
+        self.state['updated_at'] = datetime.now().isoformat(timespec='seconds')
+        if self.progress_path:
+            self.progress_path.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding='utf-8')
+        if self.quiet:
+            return
+        overall = self.state.get('overall') or {}
+        bar = self._render_bar(int(overall.get('current', 0)), int(overall.get('total', 0)))
+        total = overall.get('total') or '?'
+        current_dimension = self.state.get('current_dimension') or '-'
+        dim_progress = (self.state.get('dimension_progress') or {}).get(current_dimension) or {}
+        dim_current = dim_progress.get('current', 0)
+        dim_total = dim_progress.get('total', 0)
+        print(
+            f"{self.state['stage']} {bar} 总体 {overall.get('current', 0)}/{total} ({overall.get('percent', 0)}%) | "
+            f"{current_dimension} {dim_current}/{dim_total} | ok {self.state['success']} retry {self.state['retry']} "
+            f"fail {self.state['failed']} rows {self.state['records']} | {self.state['message']}",
+            flush=True,
+        )
+
+    def update(self, **kwargs):
+        self.state.update(kwargs)
+        total = int(self.state.get('total') or 0)
+        current = int(self.state.get('current') or 0)
+        percent = int(current * 100 / total) if total > 0 else 0
+        self.state['percent'] = percent
+        self.state['overall'] = {'current': current, 'total': total, 'percent': percent}
+        self.emit()
 
 HEADERS = [
     '数据类型', '用户名', '发表日期', '口碑标题', '综合口碑', '车型', '行驶里程', '电耗',
@@ -43,6 +107,7 @@ def url_for(series_id: int, dimensionid: int, page: int) -> str:
 
 def get_snapshot(cwd: Path, url: str, session: str, retries: int = 2):
     last_err = ''
+    retry_count = 0
     for _ in range(retries + 1):
         r1 = run(f"agent-browser --session {session} open '{url}' >/dev/null", cwd)
         if r1.returncode == 0:
@@ -50,10 +115,11 @@ def get_snapshot(cwd: Path, url: str, session: str, retries: int = 2):
             if r2.returncode == 0:
                 out = r2.stdout
                 if '查看完整口碑' in out and 'detail/view_' in out:
-                    return out.splitlines()
+                    return out.splitlines(), retry_count
             last_err = r2.stderr or r2.stdout
         else:
             last_err = r1.stderr or r1.stdout
+        retry_count += 1
         time.sleep(1)
     raise RuntimeError(last_err)
 
@@ -294,30 +360,92 @@ def extract_detail_text(lines, dim_name: str) -> str:
     return ' '.join(parts).strip()
 
 
-def collect_dimension(cwd: Path, series_id: int, dimensionid: int, start_page: int, end_page: int):
+def collect_dimension(cwd: Path, series_id: int, dimensionid: int, start_page: int, end_page: int, tracker=None, offset: int = 0, total_steps: int = 0, failed_page_list=None, target_pages=None):
     dim_name = '最满意' if dimensionid == 10 else '最不满意'
     rows, bad = [], []
     page_link_counts = {}
-    for page in range(start_page, end_page + 1):
+    retry_total = 0
+    success_pages = 0
+    failed_pages = 0
+    pages = target_pages or list(range(start_page, end_page + 1))
+    page_total = len(pages)
+    for index, page in enumerate(pages, start=1):
+        current_step = offset + index
+        if tracker:
+            dim_progress = dict(tracker.state.get('dimension_progress') or {})
+            dim_progress[dim_name] = {'current': index, 'total': page_total}
+            tracker.update(
+                stage='抓取页面',
+                current=current_step,
+                total=total_steps,
+                success=success_pages,
+                retry=retry_total,
+                failed=failed_pages,
+                records=len(rows),
+                current_dimension=dim_name,
+                dimension_progress=dim_progress,
+                message=f'{dim_name} 第 {page} 页',
+            )
         try:
-            lines = get_snapshot(cwd, url_for(series_id, dimensionid, page), f'koubei_{series_id}_{dimensionid}_{page}')
+            lines, retries_used = get_snapshot(cwd, url_for(series_id, dimensionid, page), f'koubei_{series_id}_{dimensionid}_{page}')
+            retry_total += retries_used
         except RuntimeError as e:
+            failed_pages += 1
+            if failed_page_list is not None:
+                failed_page_list.append({'dimension': dim_name, 'page': page, 'reason': str(e)})
             bad.append({'口碑维度': dim_name, '抓取页码': page, '错误': str(e)})
+            if tracker:
+                tracker.update(
+                    stage='抓取页面',
+                    current=current_step,
+                    total=total_steps,
+                    success=success_pages,
+                    retry=retry_total,
+                    failed=failed_pages,
+                    records=len(rows),
+                    message=f'{dim_name} 第 {page} 页失败',
+                )
             continue
 
         cards = extract_cards(lines)
         page_link_counts[page] = len(cards)
         if not cards:
+            failed_pages += 1
+            if failed_page_list is not None:
+                failed_page_list.append({'dimension': dim_name, 'page': page, 'reason': '未解析到口碑卡片'})
             bad.append({'口碑维度': dim_name, '抓取页码': page, '错误': '未解析到口碑卡片'})
+            if tracker:
+                tracker.update(
+                    stage='抓取页面',
+                    current=current_step,
+                    total=total_steps,
+                    success=success_pages,
+                    retry=retry_total,
+                    failed=failed_pages,
+                    records=len(rows),
+                    message=f'{dim_name} 第 {page} 页未解析到口碑卡片',
+                )
             continue
 
+        success_pages += 1
         for c in cards:
             row, valid = parse_card(c, dim_name, page, cwd=cwd)
             if valid:
                 rows.append(row)
             else:
                 bad.append(row)
-    return rows, bad, page_link_counts
+        if tracker:
+            tracker.update(
+                stage='抓取页面',
+                current=current_step,
+                total=total_steps,
+                success=success_pages,
+                retry=retry_total,
+                failed=failed_pages,
+                records=len(rows),
+                message=f'{dim_name} 第 {page} 页完成，新增 {len(cards)} 条卡片',
+            )
+    return rows, bad, page_link_counts, retry_total, success_pages, failed_pages
 
 
 def merge_aligned(sat_rows, unsat_rows):
@@ -389,6 +517,20 @@ def merge_aligned(sat_rows, unsat_rows):
     return groups, anomalies, {'common': len(common), 'only_sat': only_sat, 'only_unsat': only_unsat}
 
 
+def apply_sheet_style(ws):
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    for col in ['A','B','C','D','E','F','G','H','I','J','K','L','M','N','R','S']:
+        ws.column_dimensions[col].width = 16
+    ws.column_dimensions['O'].width = 90
+    ws.column_dimensions['P'].width = 90
+    ws.column_dimensions['Q'].width = 60
+    for row in ws.iter_rows(min_row=2):
+        row[14].alignment = Alignment(wrap_text=True, vertical='top')
+        row[15].alignment = Alignment(wrap_text=True, vertical='top')
+        row[16].alignment = Alignment(wrap_text=True, vertical='top')
+
+
 def write_xlsx(out_path: Path, groups: dict):
     wb = Workbook()
     sheet_names = ['购车口碑', '试驾口碑']
@@ -400,22 +542,71 @@ def write_xlsx(out_path: Path, groups: dict):
         ws.append(HEADERS)
         for r in groups.get(name, []):
             ws.append([r.get(h, '') for h in HEADERS])
-        for c in ws[1]:
-            c.font = Font(bold=True)
-        for col in ['A','B','C','D','E','F','G','H','I','J','K','L','M','N','R','S']:
-            ws.column_dimensions[col].width = 16
-        ws.column_dimensions['O'].width = 90
-        ws.column_dimensions['P'].width = 90
-        ws.column_dimensions['Q'].width = 60
-        for row in ws.iter_rows(min_row=2):
-            row[14].alignment = Alignment(wrap_text=True, vertical='top')
-            row[15].alignment = Alignment(wrap_text=True, vertical='top')
-            row[16].alignment = Alignment(wrap_text=True, vertical='top')
+        apply_sheet_style(ws)
     wb.save(out_path)
+
+
+def read_existing_groups(path: Path):
+    wb = load_workbook(path)
+    groups = {'购车口碑': [], '试驾口碑': []}
+    for sheet_name in groups.keys():
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        header = [cell.value for cell in ws[1]]
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            item = {}
+            for i, key in enumerate(header):
+                if key:
+                    item[str(key)] = '' if row[i] is None else str(row[i])
+            if any(item.values()):
+                groups[sheet_name].append(item)
+    return groups
+
+
+def merge_groups(existing_groups: dict, new_groups: dict, mode: str = 'keep-extra'):
+    merged = {'购车口碑': [], '试驾口碑': []}
+    for sheet_name in merged.keys():
+        by_link = {}
+        order = []
+        if mode != 'strict':
+            for row in existing_groups.get(sheet_name, []):
+                key = row.get('来源链接') or ''
+                if not key:
+                    continue
+                if key not in by_link:
+                    order.append(key)
+                by_link[key] = row
+        for row in new_groups.get(sheet_name, []):
+            key = row.get('来源链接') or ''
+            if not key:
+                continue
+            if key not in by_link:
+                order.append(key)
+            by_link[key] = row
+        merged[sheet_name] = [by_link[key] for key in order]
+    return merged
 
 
 def write_validation_report(path: Path, report: dict):
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def load_retry_pages_by_dimension(path: Path):
+    data = json.loads(path.read_text(encoding='utf-8'))
+    result = {'最满意': [], '最不满意': []}
+    for item in data:
+        page = item.get('page')
+        dim = item.get('dimension')
+        if dim not in result:
+            continue
+        if isinstance(page, int) and page > 0:
+            result[dim].append(page)
+        elif isinstance(page, str) and page.isdigit() and int(page) > 0:
+            result[dim].append(int(page))
+    for key in result:
+        result[key] = sorted(set(result[key]))
+    return result
 
 
 def main():
@@ -427,36 +618,112 @@ def main():
     parser.add_argument('--output', required=True)
     parser.add_argument('--workdir', default='.')
     parser.add_argument('--strict-validate', action='store_true')
+    parser.add_argument('--progress-file', help='进度 JSON 输出路径；默认与 output 同目录同名 .progress.json')
+    parser.add_argument('--quiet', action='store_true', help='静默模式，仅写 progress json，不打印进度行')
+    parser.add_argument('--retry-failed-pages', help='从 *.failed-pages.json 读取失败页，仅补抓这些页')
+    parser.add_argument('--merge-into', help='将补抓结果合并进已有 Excel，按 来源链接 覆盖旧记录')
+    parser.add_argument('--merge-mode', choices=['keep-extra', 'strict'], default='keep-extra', help='merge-into 时的合并模式：keep-extra 保留旧表其他记录；strict 仅保留本轮新结果')
     args = parser.parse_args()
 
     cwd = Path(args.workdir).resolve()
 
-    if args.end_page is None:
-        if args.auto_detect_pages or args.start_page == 1:
-            sat_max = detect_max_page(cwd, args.series_id, 10)
-            unsat_max = detect_max_page(cwd, args.series_id, 11)
-            args.end_page = max(sat_max, unsat_max)
-            print(f'Auto-detected end page: {args.end_page} (sat={sat_max}, unsat={unsat_max})')
-        else:
-            raise SystemExit('--end-page is required when start-page is not 1; pass --auto-detect-pages if you want automatic detection')
+    retry_pages_by_dimension = None
+    if args.retry_failed_pages:
+        retry_pages_by_dimension = load_retry_pages_by_dimension(Path(args.retry_failed_pages).resolve())
+        if not retry_pages_by_dimension['最满意'] and not retry_pages_by_dimension['最不满意']:
+            raise SystemExit('retry-failed-pages 中没有可用页码')
+        sat_target_pages = retry_pages_by_dimension['最满意']
+        unsat_target_pages = retry_pages_by_dimension['最不满意']
+        all_target_pages = sat_target_pages + unsat_target_pages
+        args.start_page = min(all_target_pages)
+        args.end_page = max(all_target_pages)
+    else:
+        if args.end_page is None:
+            if args.auto_detect_pages or args.start_page == 1:
+                sat_max = detect_max_page(cwd, args.series_id, 10)
+                unsat_max = detect_max_page(cwd, args.series_id, 11)
+                args.end_page = max(sat_max, unsat_max)
+                print(f'Auto-detected end page: {args.end_page} (sat={sat_max}, unsat={unsat_max})')
+            else:
+                raise SystemExit('--end-page is required when start-page is not 1; pass --auto-detect-pages if you want automatic detection')
+        sat_target_pages = list(range(args.start_page, args.end_page + 1))
+        unsat_target_pages = list(range(args.start_page, args.end_page + 1))
 
     if args.start_page < 1 or args.end_page < args.start_page:
         raise SystemExit('invalid page range: require start-page >= 1 and end-page >= start-page')
 
-    sat_rows, sat_bad, sat_pages = collect_dimension(cwd, args.series_id, 10, args.start_page, args.end_page)
-    unsat_rows, unsat_bad, unsat_pages = collect_dimension(cwd, args.series_id, 11, args.start_page, args.end_page)
+    out_path = Path(args.output).resolve()
+    progress_path = Path(args.progress_file).resolve() if args.progress_file else out_path.with_suffix('.progress.json')
+    tracker = ProgressTracker(label=f'autohome:{args.series_id}', progress_path=progress_path, quiet=args.quiet)
+    total_steps = len(sat_target_pages) + len(unsat_target_pages) + 2
+    failed_page_list = []
+    tracker.update(
+        stage='初始化',
+        current=0,
+        total=total_steps,
+        current_dimension='最满意',
+        dimension_progress={
+            '最满意': {'current': 0, 'total': len(sat_target_pages)},
+            '最不满意': {'current': 0, 'total': len(unsat_target_pages)},
+        },
+        output_path=str(out_path),
+        message='准备开始抓取汽车之家口碑' + ('（失败页补抓）' if args.retry_failed_pages else ''),
+        failed_pages=failed_page_list,
+    )
 
+    sat_rows, sat_bad, sat_pages, sat_retry, sat_success, sat_failed = collect_dimension(
+        cwd, args.series_id, 10, args.start_page, args.end_page, tracker=tracker, offset=0, total_steps=total_steps, failed_page_list=failed_page_list, target_pages=sat_target_pages
+    )
+    page_span = len(sat_target_pages)
+    unsat_rows, unsat_bad, unsat_pages, unsat_retry, unsat_success, unsat_failed = collect_dimension(
+        cwd, args.series_id, 11, args.start_page, args.end_page, tracker=tracker, offset=page_span, total_steps=total_steps, failed_page_list=failed_page_list, target_pages=unsat_target_pages
+    )
+
+    tracker.update(
+        stage='结果对齐',
+        current=page_span * 2 + 1,
+        total=total_steps,
+        success=sat_success + unsat_success,
+        retry=sat_retry + unsat_retry,
+        failed=sat_failed + unsat_failed,
+        records=len(sat_rows) + len(unsat_rows),
+        current_dimension='最不满意',
+        failed_pages=failed_page_list,
+        message='合并最满意/最不满意记录',
+    )
     groups, anomalies, meta = merge_aligned(sat_rows, unsat_rows)
 
-    out_path = Path(args.output).resolve()
-    write_xlsx(out_path, groups)
+    final_groups = groups
+    merge_summary = None
+    if args.merge_into:
+        merge_path = Path(args.merge_into).resolve()
+        existing_groups = read_existing_groups(merge_path)
+        final_groups = merge_groups(existing_groups, groups, mode=args.merge_mode)
+        merge_summary = {
+            'merge_into': str(merge_path),
+            'merge_mode': args.merge_mode,
+            'existing_rows': {k: len(v) for k, v in existing_groups.items()},
+            'new_rows': {k: len(v) for k, v in groups.items()},
+            'merged_rows': {k: len(v) for k, v in final_groups.items()},
+        }
+
+    write_xlsx(out_path, final_groups)
 
     report = {
         'ok': len(anomalies) == 0,
+        'input': {
+            'start_page': args.start_page,
+            'end_page': args.end_page,
+            'retry_failed_pages': args.retry_failed_pages,
+            'target_pages': {
+                '最满意': sat_target_pages,
+                '最不满意': unsat_target_pages,
+            },
+        },
         'sat_total_raw': len(sat_rows),
         'unsat_total_raw': len(unsat_rows),
-        'aligned_total': sum(len(v) for v in groups.values()),
-        'groups': {k: len(v) for k, v in groups.items()},
+        'aligned_total': sum(len(v) for v in final_groups.values()),
+        'groups': {k: len(v) for k, v in final_groups.items()},
         'page_link_counts': {
             '最满意': sat_pages,
             '最不满意': unsat_pages,
@@ -464,15 +731,39 @@ def main():
         'raw_parse_anomalies': len(sat_bad) + len(unsat_bad),
         'alignment_meta': meta,
         'anomalies': anomalies,
+        'merge': merge_summary,
     }
     report_path = out_path.with_suffix('.validation.json')
     write_validation_report(report_path, report)
+    failed_pages_path = out_path.with_suffix('.failed-pages.json')
+    failed_pages_path.write_text(json.dumps(failed_page_list, ensure_ascii=False, indent=2), encoding='utf-8')
+
+    tracker.update(
+        stage='完成',
+        current=total_steps,
+        total=total_steps,
+        success=sat_success + unsat_success,
+        retry=sat_retry + unsat_retry,
+        failed=sat_failed + unsat_failed + len(anomalies),
+        records=sum(len(v) for v in final_groups.values()),
+        validation_path=str(report_path),
+        failed_pages=failed_page_list,
+        message=f'导出完成: {out_path.name}',
+    )
 
     print(f'Wrote: {out_path}')
     print(f'Validation: {report_path}')
+    if args.retry_failed_pages:
+        print(f'Retry pages 最满意: {sat_target_pages}')
+        print(f'Retry pages 最不满意: {unsat_target_pages}')
     print('Counts:')
-    for k, v in groups.items():
+    for k, v in final_groups.items():
         print(f'- {k}: {len(v)}')
+    if merge_summary:
+        print(f"Merged into existing workbook: {merge_summary['merge_into']}")
+        print(f"Existing rows: {merge_summary['existing_rows']}")
+        print(f"New rows: {merge_summary['new_rows']}")
+        print(f"Final rows: {merge_summary['merged_rows']}")
     print(f'- raw sat: {len(sat_rows)}')
     print(f'- raw unsat: {len(unsat_rows)}')
     print(f'- anomalies: {len(anomalies)}')
@@ -485,4 +776,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
