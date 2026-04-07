@@ -448,6 +448,44 @@ def collect_dimension(cwd: Path, series_id: int, dimensionid: int, start_page: i
     return rows, bad, page_link_counts, retry_total, success_pages, failed_pages
 
 
+def build_merged_row(a, b, link):
+    dtype = '试驾探店口碑' if any([
+        a['数据类型'] == '试驾探店口碑',
+        b['数据类型'] == '试驾探店口碑',
+        a['参考价格'], b['参考价格'],
+        a['探店时间'], b['探店时间'],
+        a['探店地点'], b['探店地点'],
+    ]) else '车主购车口碑'
+
+    row = {
+        '数据类型': dtype,
+        '用户名': a['用户名'] or b['用户名'],
+        '发表日期': a['发表日期'] or b['发表日期'],
+        '口碑标题': a['口碑标题'] or b['口碑标题'],
+        '综合口碑': a['综合口碑'] or b['综合口碑'],
+        '车型': a['车型'] or b['车型'],
+        '行驶里程': a['行驶里程'] or b['行驶里程'],
+        '电耗': a['电耗'] or b['电耗'],
+        '裸车购买价': a['裸车购买价'] or b['裸车购买价'],
+        '参考价格': a['参考价格'] or b['参考价格'],
+        '购买时间': a['购买时间'] or b['购买时间'],
+        '探店时间': a['探店时间'] or b['探店时间'],
+        '购买地点': a['购买地点'] or b['购买地点'],
+        '探店地点': a['探店地点'] or b['探店地点'],
+        '最满意': a['评价详情'],
+        '最不满意': b['评价详情'],
+        '来源链接': link,
+        '最满意抓取页码': a['抓取页码'],
+        '最不满意抓取页码': b['抓取页码'],
+    }
+
+    if dtype == '车主购车口碑':
+        row['参考价格'] = ''
+        row['探店时间'] = ''
+        row['探店地点'] = ''
+    return row
+
+
 def merge_aligned(sat_rows, unsat_rows):
     sat_map = {r['来源链接']: r for r in sat_rows}
     unsat_map = {r['来源链接']: r for r in unsat_rows}
@@ -460,61 +498,44 @@ def merge_aligned(sat_rows, unsat_rows):
 
     merged = []
     anomalies = []
+    backfilled = []
 
     for link in common:
         a = sat_map[link]
         b = unsat_map[link]
-        dtype = '试驾探店口碑' if any([
-            a['数据类型'] == '试驾探店口碑',
-            b['数据类型'] == '试驾探店口碑',
-            a['参考价格'], b['参考价格'],
-            a['探店时间'], b['探店时间'],
-            a['探店地点'], b['探店地点'],
-        ]) else '车主购车口碑'
-
-        row = {
-            '数据类型': dtype,
-            '用户名': a['用户名'] or b['用户名'],
-            '发表日期': a['发表日期'] or b['发表日期'],
-            '口碑标题': a['口碑标题'] or b['口碑标题'],
-            '综合口碑': a['综合口碑'] or b['综合口碑'],
-            '车型': a['车型'] or b['车型'],
-            '行驶里程': a['行驶里程'] or b['行驶里程'],
-            '电耗': a['电耗'] or b['电耗'],
-            '裸车购买价': a['裸车购买价'] or b['裸车购买价'],
-            '参考价格': a['参考价格'] or b['参考价格'],
-            '购买时间': a['购买时间'] or b['购买时间'],
-            '探店时间': a['探店时间'] or b['探店时间'],
-            '购买地点': a['购买地点'] or b['购买地点'],
-            '探店地点': a['探店地点'] or b['探店地点'],
-            '最满意': a['评价详情'],
-            '最不满意': b['评价详情'],
-            '来源链接': link,
-            '最满意抓取页码': a['抓取页码'],
-            '最不满意抓取页码': b['抓取页码'],
-        }
-
+        row = build_merged_row(a, b, link)
         if not row['最满意'] or not row['最不满意']:
             anomalies.append({'type': 'missing_dimension_text', 'link': link, 'sat': a, 'unsat': b})
             continue
-
-        if dtype == '车主购车口碑':
-            row['参考价格'] = ''
-            row['探店时间'] = ''
-            row['探店地点'] = ''
-
         merged.append(row)
 
     for link in only_sat:
-        anomalies.append({'type': 'missing_unsat', 'link': link, 'row': sat_map[link]})
+        row = sat_map[link]
+        detail_unsat = extract_detail_text(get_snapshot_any(Path('.').resolve(), link, f"detail_fill_unsat_{hashlib.md5(link.encode('utf-8')).hexdigest()[:10]}"), '最不满意')
+        if detail_unsat:
+            filled = dict(row)
+            filled['评价详情'] = detail_unsat
+            merged.append(build_merged_row(row, filled, link))
+            backfilled.append({'link': link, 'filled': '最不满意'})
+        else:
+            anomalies.append({'type': 'missing_unsat', 'link': link, 'row': row})
+
     for link in only_unsat:
-        anomalies.append({'type': 'missing_sat', 'link': link, 'row': unsat_map[link]})
+        row = unsat_map[link]
+        detail_sat = extract_detail_text(get_snapshot_any(Path('.').resolve(), link, f"detail_fill_sat_{hashlib.md5(link.encode('utf-8')).hexdigest()[:10]}"), '最满意')
+        if detail_sat:
+            filled = dict(row)
+            filled['评价详情'] = detail_sat
+            merged.append(build_merged_row(filled, row, link))
+            backfilled.append({'link': link, 'filled': '最满意'})
+        else:
+            anomalies.append({'type': 'missing_sat', 'link': link, 'row': row})
 
     groups = {
         '购车口碑': [r for r in merged if r['数据类型'] == '车主购车口碑'],
         '试驾口碑': [r for r in merged if r['数据类型'] == '试驾探店口碑'],
     }
-    return groups, anomalies, {'common': len(common), 'only_sat': only_sat, 'only_unsat': only_unsat}
+    return groups, anomalies, {'common': len(common), 'only_sat': only_sat, 'only_unsat': only_unsat, 'backfilled': backfilled}
 
 
 def apply_sheet_style(ws):
